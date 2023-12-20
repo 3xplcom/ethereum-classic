@@ -898,6 +898,65 @@ func (s *BlockChainAPI) GetStorageAt(ctx context.Context, address common.Address
 	return res[:], state.Error()
 }
 
+// getTxStatus returns transaction status
+// for blocks before EIP658 (pre-Byzantine) it executes transaction and returns the status of tx execution
+// post-Byzantine blocks it returns a receipt status passed to the function
+func (s *BlockChainAPI) getTxStatus(ctx context.Context, block *types.Block, txIndex uint, receiptStatus uint64) (uint64, error) {
+	if block.NumberU64() <= *s.b.ChainConfig().GetEIP658Transition() {
+		msg, blockCtx, statedb, err := s.b.StateAtTransactionX(ctx, block, int(txIndex), 128)
+		if err != nil {
+			return 0, err
+		}
+		txContext := core.NewEVMTxContext(msg)
+
+		vmenv := vm.NewEVM(blockCtx, txContext, statedb, s.b.ChainConfig(), vm.Config{NoBaseFee: true})
+
+		result, err := core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(msg.GasLimit))
+		if err != nil {
+			return 0, err
+		}
+		if result.Failed() {
+			log.Info("Execution error while applying tx", "block", block.NumberU64(), "tx_index", txIndex, "err", result.Err.Error())
+			return 0, nil
+		}
+		receiptStatus = 1
+	}
+	return receiptStatus, nil
+}
+
+// GetBlockReceipts returns the block receipts for the given block hash or number or tag.
+func (s *BlockChainAPI) GetBlockReceipts(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) ([]map[string]interface{}, error) {
+	block, err := s.b.BlockByNumberOrHash(ctx, blockNrOrHash)
+	if block == nil || err != nil {
+		// When the block doesn't exist, the RPC method should return JSON null
+		// as per specification.
+		return nil, nil
+	}
+	receipts, err := s.b.GetReceipts(ctx, block.Hash())
+	if err != nil {
+		return nil, err
+	}
+	txs := block.Transactions()
+	if len(txs) != len(receipts) {
+		return nil, fmt.Errorf("receipts length mismatch: %d vs %d", len(txs), len(receipts))
+	}
+
+	// Derive the sender.
+	signer := types.MakeSigner(s.b.ChainConfig(), block.Number(), block.Time())
+
+	result := make([]map[string]interface{}, len(receipts))
+	for i, receipt := range receipts {
+		receipt.Status, err = s.getTxStatus(ctx, block, receipt.TransactionIndex, receipt.Status)
+		if err != nil {
+			log.Info("Error getting tx status", "err", err.Error())
+			return nil, err
+		}
+		result[i] = marshalReceipt(receipt, block.Hash(), block.NumberU64(), signer, txs[i], i)
+	}
+
+	return result, nil
+}
+
 // OverrideAccount indicates the overriding fields of account during the execution
 // of a message call.
 // Note, state and stateDiff can't be specified at the same time. If state is
@@ -1853,6 +1912,65 @@ func (s *TransactionAPI) GetRawTransactionByHash(ctx context.Context, hash commo
 	return tx.MarshalBinary()
 }
 
+// marshalReceipt marshals a transaction receipt into a JSON object.
+func marshalReceipt(receipt *types.Receipt, blockHash common.Hash, blockNumber uint64, signer types.Signer, tx *types.Transaction, txIndex int) map[string]interface{} {
+	from, _ := types.Sender(signer, tx)
+
+	fields := map[string]interface{}{
+		"blockHash":         blockHash,
+		"blockNumber":       hexutil.Uint64(blockNumber),
+		"transactionHash":   tx.Hash(),
+		"transactionIndex":  hexutil.Uint64(txIndex),
+		"from":              from,
+		"to":                tx.To(),
+		"gasUsed":           hexutil.Uint64(receipt.GasUsed),
+		"cumulativeGasUsed": hexutil.Uint64(receipt.CumulativeGasUsed),
+		"contractAddress":   nil,
+		"logs":              receipt.Logs,
+		"logsBloom":         receipt.Bloom,
+		"status":            hexutil.Uint(receipt.Status),
+		"type":              hexutil.Uint(tx.Type()),
+		"effectiveGasPrice": (*hexutil.Big)(receipt.EffectiveGasPrice),
+	}
+
+	if receipt.Logs == nil {
+		fields["logs"] = []*types.Log{}
+	}
+
+	// If the ContractAddress is 20 0x0 bytes, assume it is not a contract creation
+	if receipt.ContractAddress != (common.Address{}) {
+		fields["contractAddress"] = receipt.ContractAddress
+	}
+	return fields
+}
+
+// getTxStatus returns transaction status
+// for blocks before EIP658 (pre-Byzantine) it executes transaction and returns the status of tx execution
+// post-Byzantine blocks it returns a receipt status passed to the function
+func (s *TransactionAPI) getTxStatus(ctx context.Context, blockNumber uint64, blockHash common.Hash, txIndex uint64, receiptStatus uint64) (uint64, error) {
+	if blockNumber <= *s.b.ChainConfig().GetEIP658Transition() {
+		block, _ := s.b.BlockByHash(ctx, blockHash)
+		msg, blockCtx, statedb, err := s.b.StateAtTransactionX(ctx, block, int(txIndex), 128)
+		if err != nil {
+			return 0, err
+		}
+		txContext := core.NewEVMTxContext(msg)
+
+		vmenv := vm.NewEVM(blockCtx, txContext, statedb, s.b.ChainConfig(), vm.Config{NoBaseFee: true})
+
+		result, err := core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(msg.GasLimit))
+		if err != nil {
+			return 0, err
+		}
+		if result.Failed() {
+			log.Info("Error while applying tx", "block", blockNumber, "tx_index", txIndex, "err", result.Err.Error())
+			return 0, nil
+		}
+		receiptStatus = 1
+	}
+	return receiptStatus, nil
+}
+
 // GetTransactionReceipt returns the transaction receipt for the given transaction hash.
 func (s *TransactionAPI) GetTransactionReceipt(ctx context.Context, hash common.Hash) (map[string]interface{}, error) {
 	tx, blockHash, blockNumber, index, err := s.b.GetTransaction(ctx, hash)
@@ -1877,6 +1995,11 @@ func (s *TransactionAPI) GetTransactionReceipt(ctx context.Context, hash common.
 	// Derive the sender.
 	signer := types.MakeSigner(s.b.ChainConfig(), header.Number, header.Time)
 	from, _ := types.Sender(signer, tx)
+	receipt.Status, err = s.getTxStatus(ctx, blockNumber, blockHash, index, receipt.Status)
+	if err != nil {
+		log.Info("Error getting tx status", "err", err.Error())
+		return nil, err
+	}
 
 	fields := map[string]interface{}{
 		"blockHash":         blockHash,
@@ -1890,6 +2013,7 @@ func (s *TransactionAPI) GetTransactionReceipt(ctx context.Context, hash common.
 		"contractAddress":   nil,
 		"logs":              receipt.Logs,
 		"logsBloom":         receipt.Bloom,
+		"status":            hexutil.Uint(receipt.Status),
 		"type":              hexutil.Uint(tx.Type()),
 		"effectiveGasPrice": (*hexutil.Big)(receipt.EffectiveGasPrice),
 	}

@@ -623,6 +623,11 @@ web3._extend({
 			params: 1,
 		}),
 		new web3._extend.Method({
+			name: 'getBlockReceipts',
+			call: 'eth_getBlockReceipts',
+			params: 1,
+		}),
+		new web3._extend.Method({
 			name: 'call',
 			call: 'eth_call',
 			params: 4,
